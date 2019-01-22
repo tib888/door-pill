@@ -71,12 +71,20 @@ use onewire::*;
 use room_pill::{
     ir_remote::*,
     rgb::{Colors, RgbLed},
-    time::{Ticker, Ticks, Time},
 };
-use rtfm::{app, Duration, Exclusive, Instant, U32Ext};
+use rtfm::{app, Duration, Instant, U32Ext};
 // use stm32f103xx::Interrupt;
 // use sh::hio;
 // use core::fmt::Write;
+
+#[derive(Copy, Clone)]
+pub struct MyInstant(rtfm::Instant);
+
+impl ir::Instant for MyInstant {
+    fn elapsed_us_till(&self, now: &Self) -> u32 {
+        0 //TODO now.0.duration_since(self.0).cycles() / 72;
+    }
+}
 
 #[derive(Copy, Clone, PartialEq)]
 pub enum OnOff {
@@ -129,6 +137,8 @@ const APP: () = {
     static mut SWITCH_B: AcSwitch2<hal::gpio::gpioa::PA3<hal::gpio::Input<hal::gpio::PullUp>>> = ();
     static mut SWITCH_C: AcSwitch2<hal::gpio::gpioa::PA1<hal::gpio::Input<hal::gpio::PullUp>>> = ();
     static mut SWITCH_D: AcSwitch2<hal::gpio::gpioa::PA0<hal::gpio::Input<hal::gpio::PullUp>>> = ();
+    static mut IR_RECEIVER: hal::gpio::gpioa::PA15<hal::gpio::Input<hal::gpio::PullUp>> = ();
+    static mut NEC_RECEIVER: ir::IrReceiver<MyInstant> = ();
 
     #[init]
     // #[init(schedule = [foo], spawn = [foo])]
@@ -266,8 +276,7 @@ const APP: () = {
         let mut delay = Delay::new(cp.SYST, clocks);
         let mut one_wire = OneWirePort::new(onewire_io, delay);
 
-        let tick = Ticker::new(cp.DWT, cp.DCB, clocks);
-        let mut receiver = ir::IrReceiver::<Time<Ticks>>::new();
+        let mut receiver = ir::IrReceiver::<MyInstant>::new();
 
         // Schedule `bar` to run 4e6 cycles in the future
         // schedule.foo(now + 4_000_000.cycles()).unwrap();
@@ -313,6 +322,8 @@ const APP: () = {
         SWITCH_B = switch_b;
         SWITCH_C = switch_c;
         SWITCH_D = switch_d;
+        NEC_RECEIVER = receiver;
+        IR_RECEIVER = ir_receiver;
     }
 
     #[idle(resources = [WATCHDOG, IR_FIFO_C])]
@@ -375,7 +386,7 @@ const APP: () = {
 
     #[interrupt(
         priority = 2,
-        resources = [IR_FIFO_P],
+        resources = [IR_FIFO_P, NEC_RECEIVER, IR_RECEIVER],
         // schedule = [foo],
         // spawn = [foo, bar],
     )]
@@ -386,8 +397,11 @@ const APP: () = {
         // let _: EXTI0::Spawn = spawn;
 
         // update the IR receiver statemachine:
-        if let Ok(ir_cmd) = receiver.receive(start, ir_receiver.is_low()) {
-            resources.IR_FIFO_P.enqueue(ir_cmd).unwrap();
+        if let Ok(ir_cmd) = resources
+            .NEC_RECEIVER
+            .receive(MyInstant(start), resources.IR_RECEIVER.is_low())
+        {
+            resources.IR_FIFO_P.enqueue(ir_cmd);
         }
     }
 

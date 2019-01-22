@@ -33,16 +33,17 @@ git = "https://github.com/tib888/stm32f103xx-hal"
 version = "0.1.0"
 
 [dependencies.ir]
-path = "../ir"
+git = "https://github.com/tib888/ir"
+# path = "../ir"
 version = "0.2.0"
 
 [dependencies.onewire]
 git = "https://github.com/tib888/onewire"
 version = "0.4.1"
 
-[dependencies.lcd-hal]
-git = "https://github.com/tib888/lcd-hal"
-version = "0.4.0"
+# [dependencies.lcd-hal]
+# git = "https://github.com/tib888/lcd-hal"
+# version = "0.4.0"
 
 [dependencies.room-pill]
 path = "../room-pill"
