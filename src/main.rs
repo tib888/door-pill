@@ -43,382 +43,389 @@
 #![no_main]
 #![no_std]
 
-use stm32f1xx_hal::{
-    can::*, 
-    delay::Delay, 
-    gpio::{ExtiPin, *}, 
-    prelude::*, 
-    rtc, 
-    watchdog::IndependentWatchdog
-};
+//#[cfg(feature = "semihosting-debug")]
+use cortex_m_semihosting::hprintln;
+
+use panic_halt as _;
+
+use cortex_m;
+use cortex_m_rt::entry;
+
 use embedded_hal::{
     digital::v2::InputPin,
+    digital::v2::OutputPin,
     watchdog::{Watchdog, WatchdogEnable},
 };
-use heapless::{
-    consts::*,
-    i,
-    spsc::{Consumer, Producer, Queue},
+
+use stm32f1xx_hal::{
+    adc,
+    can::*,
+    delay::Delay,
+    gpio::{ExtiPin, *},
+    prelude::*,
+    rtc,
+    serial::{Config, Serial},
+    timer::Timer,
+    watchdog::IndependentWatchdog,
 };
-use onewire::*;
+
+use onewire::{ds18x20::*, temperature::Temperature, *};
+
 use room_pill::{
+    ac_sense::AcSense,
+    ac_switch::*,
+    dac::*,
     ir,
     ir::NecReceiver,
     ir_remote::*,
+    messenger::{Messenger, ID_MOVEMENT, ID_OPEN, ID_TEMPERATURE},
     rgb::{Colors, RgbLed},
-};
-use rtfm::{
-    app,
-    cyccnt::{Duration, Instant, U32Ext},
+    timing::{SysTicks, Ticker, TimeExt},
 };
 
-
-#[cfg(not(feature = "itm-debug"))]
-use panic_halt as _;
-#[cfg(feature = "itm-debug")]
-use panic_itm as _;
-
-const MHZ: u32 = 72;
-
-#[derive(Copy, Clone, PartialEq)]
-pub enum OnOff {
-    Off,
-    On,
+#[entry]
+fn main() -> ! {
+    door_unit_main();
 }
 
-pub struct AcSwitch2<PIN>
-where
-    PIN: InputPin,
-{
-    pin: PIN,
-    ac_period: Duration,
-    rised_at: Option<Instant>,
-}
+fn door_unit_main() -> ! {
+    let device = stm32f1xx_hal::pac::Peripherals::take().unwrap();
+    let mut watchdog = IndependentWatchdog::new(device.IWDG);
+    watchdog.start(stm32f1xx_hal::time::U32Ext::ms(2_000u32));
 
-impl<PIN> AcSwitch2<PIN>
-where
-    PIN: InputPin,
-{
-    pub fn new(ac_period: Duration, pin: PIN) -> AcSwitch2<PIN> {
-        AcSwitch2 {
-            pin: pin,
-            ac_period: ac_period,
-            rised_at: Option::None,
-        }
-    }
+    //10 period at 50Hz, 12 period at 60Hz
+    let ac_test_period = TimeExt::us(200_000);
+    let one_sec = TimeExt::us(1_000_000);
+    let sound_period = TimeExt::us(1_000_000u32 / 8_000u32); //room_pill::timing::Duration<u32, SysTicks> = 3_000u32.into();
 
-    pub fn update_state(&mut self, now: Instant) -> OnOff {
-        if let Ok(true) = self.pin.is_high() {
-            self.rised_at = Some(now);
-        }
-        if let Some(rised) = self.rised_at {
-            if now.duration_since(rised) <= self.ac_period {
-                return OnOff::On;
-            };
-        };
-        OnOff::Off
-    }
-}
+    let mut flash = device.FLASH.constrain();
 
-#[app(device = stm32f1xx_hal::pac, monotonic = rtfm::cyccnt::CYCCNT, peripherals = true)]
-const APP: () = {
-    struct Resources {
-        ir_producer: Producer<'static, ir::NecContent, U4>,
-        ir_consumer: Consumer<'static, ir::NecContent, U4>,
-        WATCHDOG: IndependentWatchdog,
-        SWITCH_A: AcSwitch2<stm32f1xx_hal::gpio::gpioa::PA2<stm32f1xx_hal::gpio::Input<stm32f1xx_hal::gpio::PullUp>>>,
-        SWITCH_B: AcSwitch2<stm32f1xx_hal::gpio::gpioa::PA3<stm32f1xx_hal::gpio::Input<stm32f1xx_hal::gpio::PullUp>>>,
-        SWITCH_C: AcSwitch2<stm32f1xx_hal::gpio::gpioa::PA1<stm32f1xx_hal::gpio::Input<stm32f1xx_hal::gpio::PullUp>>>,
-        SWITCH_D: AcSwitch2<stm32f1xx_hal::gpio::gpioa::PA0<stm32f1xx_hal::gpio::Input<stm32f1xx_hal::gpio::PullUp>>>,
-        IR_RECEIVER: stm32f1xx_hal::gpio::gpioa::PA15<stm32f1xx_hal::gpio::Input<stm32f1xx_hal::gpio::PullUp>>,
-        NEC_RECEIVER: ir::IrReceiver<Instant>,
-    }
+    // flash.acr.prftbe().enabled();//?? Configure Flash prefetch - Prefetch buffer is not available on value line devices
+    // scb().set_priority_grouping(NVIC_PRIORITYGROUP_4);
 
-    #[init]
-    fn init(cx: init::Context) -> init::LateResources {
-        // all interrupts are disabled here
-        // let _: Instant = start;
-        // let _: rtfm::Peripherals = core;
-        // let _: stm32f103xx::Peripherals = device;
-        // let _: init::Schedule = schedule;
-        // let _: init::Spawn = spawn;
+    let mut rcc = device.RCC.constrain();
+    let clocks = rcc
+        .cfgr
+        .use_hse(8.mhz())
+        .sysclk(72.mhz())
+        .hclk(72.mhz())
+        .pclk1(36.mhz())
+        .pclk2(72.mhz())
+        .adcclk(9.mhz()) //ADC clock: PCLK2 / 8. User specified value is be approximated using supported prescaler values 2/4/6/8.
+        .freeze(&mut flash.acr);
+    watchdog.feed();
 
-        let device = cx.device;
+    let mut core = cortex_m::Peripherals::take().unwrap();
+    #[cfg(feature = "itm-debug")]
+    let stim = &mut core.ITM.stim[0];
 
-        let mut watchdog = IndependentWatchdog::new(device.IWDG);
-        watchdog.start(2_000u32.ms());
+    let mut pwr = device.PWR;
+    let mut backup_domain = rcc.bkp.constrain(device.BKP, &mut rcc.apb1, &mut pwr);
+    // real time clock
+    let _rtc = rtc::Rtc::rtc(device.RTC, &mut backup_domain);
 
-        let mut flash = device.FLASH.constrain();
+    // A/D converter
+    let mut adc1 = adc::Adc::adc1(device.ADC1, &mut rcc.apb2, clocks);
+    watchdog.feed();
 
-        // flash.acr.prftbe().enabled();//?? Configure Flash prefetch - Prefetch buffer is not available on value line devices
-        // scb().set_priority_grouping(NVIC_PRIORITYGROUP_4);
+    let mut afio = device.AFIO.constrain(&mut rcc.apb2);
 
-        let mut rcc = device.RCC.constrain();
-        let clocks = rcc
-            .cfgr
-            .use_hse(8.mhz())
-            .sysclk(MHZ.mhz())
-            .hclk(MHZ.mhz())
-            .pclk1(36.mhz())
-            .pclk2(MHZ.mhz())
-            .adcclk(12.mhz())
-            .freeze(&mut flash.acr);
+    // Configure pins:
+    let mut gpioa = device.GPIOA.split(&mut rcc.apb2);
+    let mut gpiob = device.GPIOB.split(&mut rcc.apb2);
+    let mut gpioc = device.GPIOC.split(&mut rcc.apb2);
 
+    // Disables the JTAG to free up pb3, pb4 and pa15 for normal use
+    let (pa15, _pb3_itm_swo, pb4) = afio.mapr.disable_jtag(gpioa.pa15, gpiob.pb3, gpiob.pb4);
+    watchdog.feed();
+
+    //--------- Lights control releated
+    // Switces on A0, A1, A2, A3 (pull down once in each main period if closed)
+    let mut switch_d = AcSwitch::new(gpioa.pa0.into_pull_up_input(&mut gpioa.crl), ac_test_period);
+    let mut switch_c = AcSwitch::new(gpioa.pa1.into_pull_up_input(&mut gpioa.crl), ac_test_period);
+    let mut switch_a = AcSwitch::new(gpioa.pa2.into_pull_up_input(&mut gpioa.crl), ac_test_period);
+    let mut switch_b = AcSwitch::new(gpioa.pa3.into_pull_up_input(&mut gpioa.crl), ac_test_period);
+    // Solid state relay connected to A9 drives the lamp_b
+    let mut ssr_lamp_b = gpioa.pa9.into_push_pull_output(&mut gpioa.crh);
+    ssr_lamp_b.set_low().unwrap();
+
+    // Solid state relay connected to A10 drives the lamp_a
+    let mut ssr_lamp_a = gpioa.pa10.into_push_pull_output(&mut gpioa.crh);
+    ssr_lamp_a.set_low().unwrap();
+
+    // Photoresistor on B0 (ADC8)
+    let mut adc8_photo_resistor = gpiob.pb0.into_analog(&mut gpiob.crl);
+
+    // -------- Alarm related
+    // Motion alarm on A4 (pull down)
+    let mut motion_alarm = gpioa.pa4.into_pull_up_input(&mut gpioa.crl);
+    // Open alarm on A5 (pull down)
+    let mut open_alarm = gpioa.pa5.into_pull_up_input(&mut gpioa.crl);
+
+    // CAN (RX, TX) on A11, A12
+    let canrx = gpioa.pa11.into_floating_input(&mut gpioa.crh);
+    let cantx = gpioa.pa12.into_alternate_push_pull(&mut gpioa.crh);
+
+    // USB is needed here because it can not be used at the same time as CAN since they share memory:
+    let mut messenger = Messenger::new(Can::can1(
+        device.CAN1,
+        (cantx, canrx),
+        &mut afio.mapr,
+        &mut rcc.apb1,
+        device.USB,
+    ));
+
+    // -------- Heating control related:
+    watchdog.feed();
+
+    // DS18B20 1-wire temperature sensors connected to B4 GPIO
+    let onewire_io = pb4.into_open_drain_output(&mut gpiob.crl);
+    let delay = Delay::new(core.SYST, clocks);
+    let mut one_wire = OneWirePort::new(onewire_io, delay).unwrap();
+
+    // -------- Generic user interface related
+    // Read the NEC IR remote commands on A15 GPIO as input with internal pullup
+    let ir_receiver = pa15.into_pull_up_input(&mut gpioa.crh);
+    let mut receiver = ir::IrReceiver::new();
+
+    // PT8211 DAC (BCK, DIN, WS) on B10, B11, B12
+    let mut dac = room_pill::dac::Pt8211::new(
+        gpiob.pb10.into_push_pull_output(&mut gpiob.crh), //use as SCL?
+        gpiob.pb11.into_push_pull_output(&mut gpiob.crh), //use as SDA?
+        gpiob.pb12.into_push_pull_output(&mut gpiob.crh), //word select (left / right^)
+    );
+
+    // RGB led on PB13, PB14, PB15 as push pull output
+    let mut rgb = RgbLed::new(
+        gpiob.pb13.into_open_drain_output(&mut gpiob.crh),
+        gpiob.pb15.into_open_drain_output(&mut gpiob.crh),
+        gpiob.pb14.into_open_drain_output(&mut gpiob.crh),
+    );
+    rgb.color(Colors::Black).unwrap();
+
+    // C13 on board LED^
+    let mut led = gpioc.pc13.into_open_drain_output(&mut gpioc.crh);
+    led.set_high().unwrap();
+
+    //USART1
+    let tx = gpiob.pb6.into_alternate_push_pull(&mut gpiob.crl);
+    let rx = gpiob.pb7;
+    let serial = Serial::usart1(
+        device.USART1,
+        (tx, rx),
+        &mut afio.mapr,
+        Config::default().baudrate(2_000_000.bps()),
+        clocks,
+        &mut rcc.apb2,
+    );
+    let (mut tx, rx) = serial.split();
+
+    // Optional piezzo speaker on A8 (open drain output)
+    // TODO into_alternate_open_drain
+    let _piezzo_pin = gpioa.pa8.into_alternate_push_pull(&mut gpioa.crh);
+    // let mut piezzo =
+    //     Timer::tim1(device.TIM1, &clocks, &mut rcc.apb2).pwm(piezzo_pin, &mut afio.mapr, 1.khz()); //pwm::<Tim1NoRemap, _, _, _>
+    // piezzo.set_duty(Channel::C1, piezzo.get_max_duty() / 2);
+    // piezzo.disable(Channel::C1);
+
+    // A6, A7 not used, connected to the ground
+    let _a6 = gpioa.pa6.into_pull_down_input(&mut gpioa.crl);
+    let _a7 = gpioa.pa7.into_pull_down_input(&mut gpioa.crl);
+    // B1 not connected
+    let _b1 = gpiob.pb1.into_pull_down_input(&mut gpiob.crl);
+
+    // B3 not used, connected to the ground
+    #[cfg(not(feature = "itm-debug"))]
+    let _b3 = _pb3_itm_swo.into_pull_down_input(&mut gpiob.crl);
+    #[cfg(feature = "itm-debug")]
+    let _b3 = _pb3_itm_swo.into_push_pull_output(&mut gpiob.crl);
+    // B5 not used, connected to the ground
+    let _b5 = gpiob.pb5.into_pull_down_input(&mut gpiob.crl);
+
+    // Solid state relay or arbitrary unit can be connected to B6, B7, B8, B9
+    // let _ssr_0 = gpiob.pb6.into_push_pull_output(&mut gpiob.crl);
+    // let _ssr_1 = gpiob.pb7.into_push_pull_output(&mut gpiob.crl);
+    let _ssr_2 = gpiob.pb8.into_push_pull_output(&mut gpiob.crh);
+    let _ssr_3 = gpiob.pb9.into_push_pull_output(&mut gpiob.crh);
+    // C14, C15 used on the bluepill board for 32768Hz xtal
+    watchdog.feed();
+
+    const MAX_THERMOMETER_COUNT: usize = 2; //max number of thermometers
+
+    //store the addresses of temp sensors, start measurement on each:
+    let mut roms = [[0u8; 8]; MAX_THERMOMETER_COUNT];
+    let mut count = 0;
+
+    let mut it = RomIterator::new(0);
+    loop {
         watchdog.feed();
 
-        // real time clock
-        let mut pwr = device.PWR;
-        let mut backup_domain = rcc.bkp.constrain(device.BKP, &mut rcc.apb1, &mut pwr);
-        let _rtc = rtc::Rtc::rtc(device.RTC, &mut backup_domain);
-        watchdog.feed();
-
-        // Configure pins:
-        let mut gpioa = device.GPIOA.split(&mut rcc.apb2);
-        let mut gpiob = device.GPIOB.split(&mut rcc.apb2);
-        let mut gpioc = device.GPIOC.split(&mut rcc.apb2);
-
-        let mut afio = device.AFIO.constrain(&mut rcc.apb2);
-        // Disables the JTAG to free up pb3, pb4 and pa15 for normal use
-        let (pa15, _pb3_itm_swo, pb4) = afio.mapr.disable_jtag(gpioa.pa15, gpiob.pb3, gpiob.pb4);
-
-        // Switces on A0, A1, A2, A3 (pull down once in each main period if closed)
-        let ac_period = (clocks.sysclk().0 / 50u32).cycles();
-
-        let mut pa0 = gpioa.pa0.into_pull_up_input(&mut gpioa.crl);
-        pa0.make_interrupt_source(&mut afio);
-        pa0.trigger_on_edge(&device.EXTI, Edge::RISING_FALLING);
-        let switch_d = AcSwitch2::new(ac_period, pa0);
-
-        let mut pa1 = gpioa.pa1.into_pull_up_input(&mut gpioa.crl);
-        pa1.make_interrupt_source(&mut afio);
-        pa1.trigger_on_edge(&device.EXTI, Edge::RISING_FALLING);
-        let switch_c = AcSwitch2::new(ac_period, pa1);
-
-        let mut pa2 = gpioa.pa2.into_pull_up_input(&mut gpioa.crl);
-        pa2.make_interrupt_source(&mut afio);
-        pa2.trigger_on_edge(&device.EXTI, Edge::RISING_FALLING);
-        let switch_a = AcSwitch2::new(ac_period, pa2);
-
-        let mut pa3 = gpioa.pa3.into_pull_up_input(&mut gpioa.crl);
-        pa3.make_interrupt_source(&mut afio);
-        pa3.trigger_on_edge(&device.EXTI, Edge::RISING_FALLING);
-        let switch_b = AcSwitch2::new(ac_period, pa3);
-
-        // Motion alarm on A4 (pull down)
-        let _motion_alarm = gpioa.pa4.into_pull_up_input(&mut gpioa.crl);
-
-        // Open alarm on A5 (pull down)
-        let _open_alarm = gpioa.pa5.into_pull_up_input(&mut gpioa.crl);
-
-        // A6, A7 not used, connected to the ground
-        let _a6 = gpioa.pa6.into_pull_down_input(&mut gpioa.crl);
-        let _a7 = gpioa.pa7.into_pull_down_input(&mut gpioa.crl);
-
-        // Optional piezzo speaker on A8
-        let _piezzo = gpioa.pa8.into_open_drain_output(&mut gpioa.crh);
-
-        // Solid state relay connected to A9 drives the lamp_b
-        let _ssr_lamp_b = gpioa.pa9.into_push_pull_output(&mut gpioa.crh);
-
-        // Solid state relay connected to A10 drives the lamp_a
-        let _ssr_lamp_a = gpioa.pa10.into_push_pull_output(&mut gpioa.crh);
-
-        // CAN (RX, TX) on A11, A12
-        let canrx = gpioa.pa11.into_floating_input(&mut gpioa.crh);
-        let cantx = gpioa.pa12.into_alternate_push_pull(&mut gpioa.crh);
-        // USB is needed here because it can not be used at the same time as CAN since they share memory:
-        let _can = Can::can1(
-            device.CAN1,
-            (cantx, canrx),
-            &mut afio.mapr,
-            &mut rcc.apb1,
-            device.USB,
-        );
-
-        // Read the NEC IR remote commands on A15 GPIO as input with internal pullup
-        let ir_receiver = pa15.into_pull_up_input(&mut gpioa.crh);
-
-        // Photoresistor on B0 (ADC8)
-        let _photoresistor = gpiob.pb0.into_floating_input(&mut gpiob.crl);
-
-        // B1 not connected
-        let _b1 = gpiob.pb1.into_pull_down_input(&mut gpiob.crl);
-
-        // B3 not used, connected to the ground
-        #[cfg(not(feature = "itm-debug"))]
-        let _b3 = _pb3_itm_swo.into_pull_down_input(&mut gpiob.crl);
-        #[cfg(feature = "itm-debug")]
-        let _b3 = _pb3_itm_swo.into_push_pull_output(&mut gpiob.crl);
-
-        // DS18B20 1-wire temperature sensors connected to B4 GPIO
-        let onewire_io = pb4.into_open_drain_output(&mut gpiob.crl);
-
-        // B5 not used, connected to the ground
-        let _b5 = gpiob.pb5.into_pull_down_input(&mut gpiob.crl);
-
-        // Solid state relay or arbitrary unit can be connected to B6, B7, B8, B9
-        let _ssr_0 = gpiob.pb6.into_push_pull_output(&mut gpiob.crl);
-        let _ssr_1 = gpiob.pb7.into_push_pull_output(&mut gpiob.crl);
-        let _ssr_2 = gpiob.pb8.into_push_pull_output(&mut gpiob.crh);
-        let _ssr_3 = gpiob.pb9.into_push_pull_output(&mut gpiob.crh);
-
-        // PT8211 DAC (BCK, DIN, WS) on B10, B11, B12
-        let _dac = room_pill::dac::Pt8211::new(
-            gpiob.pb10.into_push_pull_output(&mut gpiob.crh), //use as SCL?
-            gpiob.pb11.into_push_pull_output(&mut gpiob.crh), //use as SDA?
-            gpiob.pb12.into_push_pull_output(&mut gpiob.crh), //word select (left / right^)
-        );
-
-        // RGB led on PB13, PB14, PB15 as push pull output
-        let mut rgb = RgbLed::new(
-            gpiob.pb13.into_push_pull_output(&mut gpiob.crh),
-            gpiob.pb14.into_push_pull_output(&mut gpiob.crh),
-            gpiob.pb15.into_push_pull_output(&mut gpiob.crh),
-        );
-        rgb.color(Colors::Black);
-
-        // C13 on board LED^
-        let mut led = gpioc.pc13.into_push_pull_output(&mut gpioc.crh);
-        //led.set_high().unwrap();
-
-        // C14, C15 used on the bluepill board for 32768Hz xtal
-        watchdog.feed();
-
-        let mut delay = Delay::new(cx.core.SYST, clocks);
-        let mut _one_wire = OneWirePort::new(onewire_io, delay);
-
-        let receiver = ir::IrReceiver::<Instant>::new();
-        
-        //setup external interrupts EXTI0,1,2,3,4,EXTI9_5,EXTI15_10
-                     
-        static mut IR_QUEUE: Queue<ir::NecContent, U4> = Queue(i::Queue::new());
-        
-        unsafe {
-            let (ir_producer, ir_consumer) = IR_QUEUE.split();
-            
-            // Initialization of late resources
-            init::LateResources {
-                ir_producer: ir_producer,
-                ir_consumer: ir_consumer,
-                WATCHDOG: watchdog,            
-                SWITCH_A: switch_a,
-                SWITCH_B: switch_b,
-                SWITCH_C: switch_c,
-                SWITCH_D: switch_d,
-                NEC_RECEIVER: receiver,
-                IR_RECEIVER: ir_receiver,
+        match one_wire.iterate_next(true, &mut it) {
+            Ok(None) => {
+                break; //no or no more devices found -> stop
             }
-        }
-    }
 
-    #[idle(resources = [WATCHDOG, ir_consumer])] 
-    fn idle(c: idle::Context) -> ! {
-        // the interrupts are enabled here
-        loop {
-            c.resources.WATCHDOG.feed();
+            Ok(Some(rom)) => {
+                if let Some(_device_type) = detect_18x20_devices(rom[0]) {
+                    //writeln!(tx, "rom: {:?}", &rom).unwrap();
 
-            if let Some(ir_cmd) = c.resources.ir_consumer.dequeue() {
-                match ir_cmd {
-                    ir::NecContent::Repeat => {}
-                    ir::NecContent::Data(data) => {
-                        let command = translate(data);
-                        // write!(hstdout, "{:x}={:?} ", data, command).unwrap();
-                        // model.ir_remote_command(command, &MENU);
-                        // model.refresh_display(&mut display, &mut backlight);
+                    //TODO use this address as unique id on the CAN bus!
+                    roms[count] = *rom;
+                    //messenger.transmit(ID_TEMPERATURE, Payload::new(rom));
+                    count = count + 1;
+                    let _ = one_wire.start_temperature_measurement(&rom);
+                    if count >= MAX_THERMOMETER_COUNT {
+                        break;
                     }
                 }
+                continue;
+            }
+
+            Err(_e) => {
+                rgb.color(Colors::White).unwrap();
+                break;
             }
         }
     }
+    //not mutable anymore
+    let roms = roms;
+    let count = count;
+    let mut temperatures = [Option::<Temperature>::None; MAX_THERMOMETER_COUNT];
 
-    #[task(
-        binds = EXTI0,
-        priority = 1,
-        resources = [SWITCH_D],
-    )]
-    fn exti0(c: exti0::Context) {
-        let state = c.resources.SWITCH_D.update_state(Instant::now()); 
-        //TODO on state change notify the main loop...
-    }
+    let mut lux = Option::<u32>::None;
 
-    #[task(
-        binds = EXTI1,
-        priority = 1,
-        resources = [SWITCH_C],
-    )]
-    fn exti1(c: exti1::Context) {
-        let state = c.resources.SWITCH_C.update_state(Instant::now());
-        //TODO on state change notify the main loop...
-    }
+    // -------- Config finished
+    watchdog.feed();
+    let tick = Ticker::new(core.DWT, core.DCB, clocks);
+    //let tick = MonoTimer::new(core.DWT, clocks); //core.DCB,
 
-    #[task(
-        binds = EXTI2,
-        priority = 1,
-        resources = [SWITCH_A],
-    )]
-    fn exti2(c: exti2::Context) {
-        let state = c.resources.SWITCH_A.update_state(Instant::now());
-        //TODO on state change notify the main loop...
-        //and toggle lamp A?
-    }
+    //todo beep(piezzo, 440, 100);
 
-    #[task(
-        binds = EXTI3,
-        priority = 1,
-        resources = [SWITCH_B],
-    )]
-    fn exti3(c: exti3::Context) {
-        let state = c.resources.SWITCH_B.update_state(Instant::now());
-        //TODO on state change notify the main loop...
-        //and toggle lamp B?
-    }
+    let mut last_time = tick.now();
+    let mut last_big_time = last_time;
+    let mut last_sound_time = last_time;
 
-    #[task(
-        binds = EXTI15_10,
-        priority = 2,
-        resources = [NEC_RECEIVER, IR_RECEIVER, ir_producer],   
-        // schedule = [foo],
-        // spawn = [foo, bar],
-    )]
-    fn exti15_10(c: exti15_10::Context) {
-        // let _: Instant = start;
-        // let _: resources::IR_FIFO_P = resources.IR_FIFO_P;
-        // let _: EXTI0::Schedule = schedule;
-        // let _: EXTI0::Spawn = spawn;
-        let now = Instant::now();
+    let mut sound = 0u8;
 
-        let ir_cmd = c.resources.NEC_RECEIVER.receive(
-            c.resources.IR_RECEIVER.is_low().unwrap(),
-            now,
-            |last| now.duration_since(last).as_cycles() / MHZ,
-        ); //in case of 72MHz, 72 clock = 1 microsecond
+    rgb.color(Colors::Black).unwrap();
 
-        // update the IR receiver statemachine:
-        if let Ok(ir_cmd) = ir_cmd {
-            c.resources.ir_producer.enqueue(ir_cmd);
+    //Unique ID: 50ff6c065177535424281587 [40, 97, 100, 18, 46, 79, 94, 252]
+    //hprintln!("Unique ID: {} {:?}", stm32_device_signature::device_id_hex(), roms[0]).unwrap();
+
+    //main update loop
+    loop {
+        watchdog.feed();
+
+        // calculate the time since last execution:
+        let now = tick.now();
+        let delta = tick.to_us(now - last_time); //in case of 72MHz sysclock this works if less than 59sec passed between two calls
+        last_time = now;
+       
+        //update the IR receiver statemachine:
+        let ir_cmd = receiver.receive(ir_receiver.is_low().unwrap(), now, |last| {
+            tick.to_us(now - last).into()
+        });
+
+        // if tick.to_us(tick.now() - last_sound_time) > sound_period {
+        //     last_sound_time = now;
+        //     sound = sound & 127;
+        //     let a = (SINUS[sound as usize] as i16) * 256;
+        //     dac.stereo(a as u16, a as u16).unwrap();            
+        //     sound += 7; //appprox 440hz = 7*8000/128                        
+        // }
+
+        match ir_cmd {
+            Ok(ir::NecContent::Repeat) => {}
+            Ok(ir::NecContent::Data(data)) => {
+                let ir_command = translate(data);
+            }
+            _ => {}
         }
+
+        switch_a.update(delta).unwrap();
+        switch_b.update(delta).unwrap();
+        switch_c.update(delta).unwrap();
+        switch_d.update(delta).unwrap();
+
+        //messenger.receive_log(&mut tx);
+        if let Some((filter_match_index, time_stamp, frame)) = messenger.try_receive() {
+            // hprintln!(
+            //     "Door f:{} t:{} i:{} d:{}",
+            //     filter_match_index,
+            //     time_stamp,
+            //     frame.id().standard(),
+            //     frame.data().data_as_u64()
+            // ).unwrap();
+        }
+
+        // do not execute the followings too often: (temperature conversion time of the sensors is a lower limit)
+        let big_delta = tick.to_us(now - last_big_time);
+        if big_delta < one_sec {
+            continue;
+        }
+        last_big_time = now;
+        //rgb.color(Colors::Green).unwrap();
+        //messenger.transmit(ID_MOVEMENT, Payload::new(&roms[0]));
+
+        if motion_alarm.is_high() == Ok(true) {
+            //TODO send can message on rising edges
+            //rgb.color(Colors::Purple).unwrap(); //todo remove?
+            //let _ = messenger.transmit(ID_MOVEMENT, Payload::new(&roms[0]));
+        }
+
+        if open_alarm.is_high() == Ok(true) {
+            //TODO send can message on rising edges
+            //rgb.color(Colors::Cyan).unwrap(); //todo remove?
+            //messenger.transmit(ID_OPEN, Payload::new(&roms[0]));
+        }
+
+        //read sensors and restart temperature measurement
+        for i in 0..count {
+            temperatures[i] = match one_wire.read_temperature_measurement_result(&roms[i]) {
+                Ok(temperature) => {
+                    //TODO
+                    // let mut buffer = [0u8; 8];
+                    // temperature.whole_degrees().numtoa(10, &mut buffer);
+                    // // buffer[4] = b'.';
+                    // // temperature.fraction_degrees().numtoa(10, &mut buffer);
+                    // messenger.transmit(
+                    //  	ID_OPEN,
+                    // 	Payload::new(&buffer),
+                    // );
+
+                    Some(temperature)
+                }
+                Err(_code) => None,
+            };
+
+            let _ = one_wire.start_temperature_measurement(&roms[i]);
+        }
+
+        //TODO send can message
+        //TODO receive can light control
+        //TODO receive can sound ?
+        //TODO receive can ring control ?
+        //TODO measure light and send can message in case of change
+        let light: u32 = adc1.read(&mut adc8_photo_resistor).unwrap();
+        if let Some(l) = lux {
+            if l != light {
+                lux = Some(light);
+                //TODO send can message
+            }
+        } else {
+            lux = Some(light);
+        }
+
+        led.toggle().unwrap();
     }
+}
 
-    //EXTI line 16 is connected to the PVD output
-    //EXTI line 17 is connected to the RTC Alarm event
-    //EXTI line 18 is connected to the USB Wakeup event
-
-    // #[exception(schedule = [foo], spawn = [foo])]
-    // fn SVCall() {
-    //     let _: Instant = start;
-    //     let _: SVCall::Schedule = schedule;
-    //     let _: SVCall::Spawn = spawn;
-    // }
-
-    // #[task(priority = 2, resources = [SHARED], schedule = [foo], spawn = [foo])]
-    // fn foo() {
-    //     let _: Instant = scheduled;
-    //     let _: Exclusive<u32> = resources.SHARED;
-    //     let _: foo::Resources = resources;
-    //     let _: foo::Schedule = schedule;
-    //     let _: foo::Spawn = spawn;
-    // }
-    // extern "C" {
-    //     fn UART1();
-    // }
-};
+static SINUS: [i8; 128] = [
+    0, 6, 12, 19, 25, 31, 37, 43, 49, 54, 60, 65, 71, 76, 81, 85, 90, 94, 98, 102, 106, 109, 112,
+    115, 117, 120, 122, 123, 125, 126, 126, 127, 127, 127, 126, 126, 125, 123, 122, 120, 117, 115,
+    112, 109, 106, 102, 98, 94, 90, 85, 81, 76, 71, 65, 60, 54, 49, 43, 37, 31, 25, 19, 12, 6, 0,
+    -6, -12, -19, -25, -31, -37, -43, -49, -54, -60, -65, -71, -76, -81, -85, -90, -94, -98, -102,
+    -106, -109, -112, -115, -117, -120, -122, -123, -125, -126, -126, -127, -127, -127, -126, -126,
+    -125, -123, -122, -120, -117, -115, -112, -109, -106, -102, -98, -94, -90, -85, -81, -76, -71,
+    -65, -60, -54, -49, -43, -37, -31, -25, -19, -12, -6,
+];
